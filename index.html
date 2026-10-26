@@ -166,17 +166,24 @@ ul.chg{margin:4px 0 0;padding-inline-start:18px;color:var(--muted);font-size:12.
 /* ربط Cashier بـ Firebase (مشروع raj-co) */
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import { initializeFirestore, doc, collection, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, limit, orderBy, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
-import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserSessionPersistence } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserSessionPersistence, updatePassword } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 const CFG={apiKey:"AIzaSyDQ37XDYKYPpME5vRwt0emiNQj3dspQU7s",authDomain:"raj-co.firebaseapp.com",projectId:"raj-co",storageBucket:"raj-co.firebasestorage.app",messagingSenderId:"363251868503",appId:"1:363251868503:web:1cf69c6aca0b38d5eb5412"};
 // يكتشف اسم قاعدة البيانات في المشروع: (default) أو default
 async function detectDb(){
-  const key="fb.dbid."+CFG.projectId; try{const c=localStorage.getItem(key);if(c)return c;}catch(e){}
   for(const id of ["(default)","default"]){
     try{const r=await fetch("https://firestore.googleapis.com/v1/projects/"+CFG.projectId+"/databases/"+id+"/documents/settings?pageSize=1&key="+CFG.apiKey);
-      if(r.status!==404){try{localStorage.setItem(key,id);}catch(e){}return id;}}catch(e){}
+      if(r.status!==404)return id;}catch(e){}
   }
   return "(default)";
 }
+const toVal=v=>{
+  if(v===null||v===undefined)return{nullValue:null};
+  if(typeof v==="boolean")return{booleanValue:v};
+  if(typeof v==="number")return Number.isInteger(v)?{integerValue:String(v)}:{doubleValue:v};
+  if(typeof v==="string")return{stringValue:v};
+  if(Array.isArray(v))return{arrayValue:v.length?{values:v.map(toVal)}:{}};
+  const f={};for(const k of Object.keys(v))if(v[k]!==undefined)f[k]=toVal(v[k]);return{mapValue:{fields:f}};
+};
 try{
   const app=initializeApp(CFG);
   const DBID=await detectDb();
@@ -195,7 +202,16 @@ try{
     signOut:()=>signOut(auth),onAuthStateChanged:cb=>onAuthStateChanged(auth,cb)};
   let sec=null;
   async function createSecondaryUser(email,pw){sec=sec||initializeApp(CFG,"sec");const a2=getAuth(sec);try{await createUserWithEmailAndPassword(a2,email,pw);}finally{try{await signOut(a2);}catch(e){}}}
-  window.__fbResolve({fdb,fauth,createSecondaryUser,DBID});
+  async function restCommit(list){
+    if(!auth.currentUser)throw new Error("not signed in");
+    const tok=await auth.currentUser.getIdToken();
+    const base="projects/"+CFG.projectId+"/databases/"+DBID+"/documents";
+    const r=await fetch("https://firestore.googleapis.com/v1/"+base+":commit",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},
+      body:JSON.stringify({writes:list.map(([p,d])=>({update:{name:base+"/"+p,fields:toVal(d).mapValue.fields}}))})});
+    if(!r.ok){let m="";try{const j=await r.json();m=(j.error&&(j.error.status+" "+j.error.message))||"";}catch(e){}throw new Error("HTTP "+r.status+" "+m);}
+  }
+  const updatePw=pw=>updatePassword(auth.currentUser,pw);
+  window.__fbResolve({fdb,fauth,createSecondaryUser,restCommit,updatePw,DBID});
 }catch(e){window.__fbResolve({error:e});}
 </script>
 <script>
@@ -592,10 +608,24 @@ async function encDoc(obj,k=DK){const iv=rnd(12);const ct=await crypto.subtle.en
 async function decDoc(d){if(!d||!d.enc)return d;if(!DK)return null;try{return JSON.parse(TD.decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:ub64(d.iv)},DK,ub64(d.ct))));}catch(e){return null;}}
 const encOn=()=>!!usersDoc.enc;
 const newSecret=()=>b64(rnd(24));
+let AK=null, myBundle={};
+async function aesEnc(k,bytes){const iv=rnd(12);return{iv:b64(iv),ct:b64(await crypto.subtle.encrypt({name:'AES-GCM',iv},k,bytes))};}
+async function aesDec(k,o){return new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:ub64(o.iv)},k,ub64(o.ct)));}
+const impKey=raw=>crypto.subtle.importKey('raw',raw,'AES-GCM',true,['encrypt','decrypt']);
+async function deriveFbPw(u,pw){const base=await crypto.subtle.importKey('raw',TE.encode(pw),'PBKDF2',false,['deriveBits']);
+  const bits=await crypto.subtle.deriveBits({name:'PBKDF2',salt:TE.encode('raj-co.cashier.fb|'+u),iterations:150000,hash:'SHA-256'},base,256);return 'Cx'+b64(new Uint8Array(bits));}
+async function makeWrap(pw,bundle){const salt=b64(rnd(16));const kek=await kekFrom(pw,salt);const raw=await crypto.subtle.exportKey('raw',DK);
+  const a=await aesEnc(kek,raw), b=await aesEnc(kek,TE.encode(JSON.stringify(bundle||{})));return{wk:{s:salt,iv:a.iv,ct:a.ct},wb:b};}
+async function openWrap(pw,x){try{const kek=await kekFrom(pw,x.wk.s);const dk=await impKey(await aesDec(kek,x.wk));
+  let b={};if(x.wb)b=JSON.parse(TD.decode(await aesDec(kek,x.wb)));return{dk,b};}catch(e){return null;}}
+async function encWith(k,obj){return aesEnc(k,TE.encode(JSON.stringify(obj)));}
+async function decWith(k,o){try{return JSON.parse(TD.decode(await aesDec(k,o)));}catch(e){return null;}}
+async function loadAK(){AK=myBundle&&myBundle.ak?await impKey(ub64(myBundle.ak)):null;}
+const needsTemp=u=>!u.wb;
+const withTimeout=(p,ms,msg)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(Object.assign(new Error(msg||'timeout'),{code:'timeout'})),ms))]);
 async function createFbUser(u,secret){await FBX.createSecondaryUser(emailOf(u),secret);}
-async function fbSignIn(u){const x=users[u];const v=x&&x.as?await decDoc(x.as):null;if(!v||!v.s)throw Object.assign(new Error('noacct'),{code:'noacct'});
-  await fauth.signInWithEmailAndPassword(emailOf(u),v.s);}
-function fbErr(e){const c=e&&e.code||'';return c==='noacct'?'حسابك يحتاج كلمة سر مؤقتة من المالك قبل الدخول.':c==='auth/email-already-in-use'?'الحساب ده موجود بالفعل في Firebase Authentication. امسحه من Firebase Console وجرب تاني.':c==='auth/too-many-requests'?'محاولات كتير. استنى شوية وجرب تاني.':c==='auth/operation-not-allowed'?'فعّل Email/Password من Firebase Console ← Authentication ← Sign-in method.':c==='auth/network-request-failed'?'مافيش اتصال بالإنترنت.':'حصل خطأ: '+(e&&(e.code||e.message)||'');}
+async function fbSignIn(u,pw,bundle){const fp=bundle&&bundle.sec?bundle.sec:await deriveFbPw(u,pw);await fauth.signInWithEmailAndPassword(emailOf(u),fp);}
+function fbErr(e){const c=e&&e.code||'';return c==='noacct'?'حسابك يحتاج كلمة سر مؤقتة من المالك قبل الدخول.':c==='auth/email-already-in-use'?'الحساب ده موجود بالفعل في Firebase Authentication. امسحه من Firebase Console ← Authentication ← Users وجرب تاني.':c==='auth/invalid-credential'||c==='auth/wrong-password'||c==='auth/invalid-login-credentials'?'حساب Firebase مش متطابق. امسح المستخدم من Firebase Console ← Authentication ← Users، وخلي المالك يدّيله كلمة سر مؤقتة جديدة.':c==='timeout'?'قاعدة البيانات مش بترد. اتأكد إن Firestore Database معمولة وإن القواعد متنشرة (Publish)، وجرب تاني.':c==='auth/requires-recent-login'?'لتغيير كلمة السر: اعمل تسجيل خروج ودخول تاني وبعدين غيّرها على طول.':c==='auth/too-many-requests'?'محاولات كتير. استنى شوية وجرب تاني.':c==='auth/operation-not-allowed'?'فعّل Email/Password من Firebase Console ← Authentication ← Sign-in method.':c==='auth/network-request-failed'?'مافيش اتصال بالإنترنت.':'حصل خطأ: '+(e&&(e.code||e.message)||'');}
 async function pack(obj,k=DK){if(!encOn())return obj;if(!k)throw new Error('locked');return encDoc(obj,k);}
 
 /* ---------- users & permissions ---------- */
@@ -611,15 +641,16 @@ function userName(u){return users[u]?.name||u||'';}
 function fmtTime(t){if(!t)return'';const d=new Date(t);return d.toLocaleDateString('en-GB')+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});}
 async function hashPw(salt,pw){const b=await crypto.subtle.digest('SHA-256',TE.encode(salt+':'+pw));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');}
 const SKEY='cashier.session', IDLE_MIN=30;
-async function saveSession(){try{sessionStorage.setItem(SKEY,JSON.stringify({u:me,w:(users[me]?.wk?.ct||users[me]?.hash||'').slice(0,24),k:DK?b64(await crypto.subtle.exportKey('raw',DK)):null,t:Date.now()}));}catch(e){}}
+async function saveSession(){try{sessionStorage.setItem(SKEY,JSON.stringify({u:me,w:(users[me]?.wk?.ct||users[me]?.hash||'').slice(0,24),k:DK?b64(await crypto.subtle.exportKey('raw',DK)):null,b:myBundle||{},t:Date.now()}));}catch(e){}}
 function clearSession(){try{sessionStorage.removeItem(SKEY);localStorage.removeItem(SKEY);}catch(e){}}
 async function restoreSession(){try{const s=JSON.parse(sessionStorage.getItem(SKEY)||'null');if(!s)return false;const u=users[s.u];
   if(!u||u.locked||u.mustChange||Date.now()-s.t>IDLE_MIN*60000)return false;
   if(encOn()){if(!u.wk||u.wk.ct.slice(0,24)!==s.w||!s.k)return false;DK=await crypto.subtle.importKey('raw',ub64(s.k),'AES-GCM',true,['encrypt','decrypt']);}
   else if(!u.hash||u.hash.slice(0,24)!==s.w)return false;
   if(!fauth.currentUser||fauth.currentUser.email!==emailOf(s.u))return false;
+  myBundle=s.b||{};await loadAK();
   me=s.u;return true;}catch(e){return false;}}
-function kick(msg){flushAllAudit();stopData();fauth.signOut().catch(()=>{});me=null;DK=null;clearSession();gateMsg=msg;gateStep='login';wipePlain();render();}
+function kick(msg){flushAllAudit();AK=null;myBundle={};stopData();fauth.signOut().catch(()=>{});me=null;DK=null;clearSession();gateMsg=msg;gateStep='login';wipePlain();render();}
 function checkMe(){if(!me)return;const u=users[me];let s=null;try{s=JSON.parse(sessionStorage.getItem(SKEY)||'null');}catch(e){}
   const tag=(u?.wk?.ct||u?.hash||'').slice(0,24);
   if(!u)return kick('تم حذف حسابك.');if(u.locked)return kick('تم إيقاف حسابك. تواصل مع المالك.');
@@ -715,11 +746,12 @@ gate.addEventListener('submit',async e=>{
     if(!/^[a-z0-9._-]{2,30}$/.test(u))return err('اسم المستخدم بالحروف الإنجليزية والأرقام فقط.');
     if(!strong(pw))return err('كلمة السر 8 حروف على الأقل وفيها حروف وأرقام.'); if(pw!==v('g-pw2'))return err('كلمتا السر غير متطابقتين.');
     DK=await crypto.subtle.generateKey({name:'AES-GCM',length:256},true,['encrypt','decrypt']);
-    const secret=newSecret();
-    try{await fauth.createUserWithEmailAndPassword(emailOf(u),secret);}catch(e2){return err(fbErr(e2));}
-    users[u]={name:v('g-name').trim()||u,role:'owner',branches:Object.keys(BR),perms:{},locked:false,wk:await wrapKey(pw),as:await encDoc({s:secret}),created:new Date().toISOString()};
+    const akKey=await crypto.subtle.generateKey({name:'AES-GCM',length:256},true,['encrypt','decrypt']);
+    myBundle={ak:b64(await crypto.subtle.exportKey('raw',akKey))};await loadAK();
+    try{await fauth.createUserWithEmailAndPassword(emailOf(u),await deriveFbPw(u,pw));}catch(e2){return err(fbErr(e2));}
+    users[u]={name:v('g-name').trim()||u,role:'owner',branches:Object.keys(BR),perms:{},locked:false,...await makeWrap(pw,myBundle),created:new Date().toISOString()};
     usersDoc.enc=1;
-    if(!await saveUsers())return err('تعذّر الحفظ، حاول مرة أخرى.');
+    try{await FBX.restCommit([['settings/users',{...usersDoc,users}]]);}catch(e2){return err('تعذّر الحفظ: '+e2.message);}
     me=u;await saveSession();await afterLogin('إنشاء حساب المالك');return;
   }
   if(step==='import'){
@@ -730,16 +762,21 @@ gate.addEventListener('submit',async e=>{
     const ud=JSON.parse(JSON.stringify(j.docs['settings/users']));const x=(ud.users||{})[u];
     if(!x||!x.wk||x.role!=='owner')return err('اسم المستخدم ده مش مالك في النسخة الاحتياطية.');
     const k=await unwrapKey(pw,x.wk);if(!k)return err('كلمة السر غير صحيحة لهذا المستخدم في النسخة الاحتياطية.');
-    DK=k;const secret=newSecret();
-    err('جارٍ إنشاء الحساب…');
-    try{await fauth.createUserWithEmailAndPassword(emailOf(u),secret);}catch(e2){DK=null;return err(fbErr(e2));}
-    for(const[k2,y]of Object.entries(ud.users)){delete y.as;delete y.fails;delete y.hash;delete y.salt;}
-    x.as=await encDoc({s:secret});x.mustChange=false;x.locked=false;ud.enc=1;
+    DK=k;
+    const akKey=await crypto.subtle.generateKey({name:'AES-GCM',length:256},true,['encrypt','decrypt']);
+    myBundle={ak:b64(await crypto.subtle.exportKey('raw',akKey))};await loadAK();
+    err('جارٍ إنشاء حساب المالك…');
+    const fp=await deriveFbPw(u,pw);
+    try{await fauth.createUserWithEmailAndPassword(emailOf(u),fp);}
+    catch(e2){if(e2&&e2.code==='auth/email-already-in-use'){try{await fauth.signInWithEmailAndPassword(emailOf(u),fp);}catch(e3){DK=null;return err('فيه حساب قديم باسم '+emailOf(u)+' في Firebase. امسحه من Firebase Console ← Authentication ← Users وجرب تاني.');}}
+      else{DK=null;return err(fbErr(e2));}}
+    for(const[k2,y]of Object.entries(ud.users)){delete y.as;delete y.asA;delete y.fails;delete y.hash;delete y.salt;if(k2!==u){delete y.wk;delete y.wb;y.mustChange=true;}}
+    Object.assign(x,await makeWrap(pw,myBundle));x.mustChange=false;x.locked=false;ud.enc=1;
     try{
-      err('جارٍ نقل المستخدمين…');await fdb.doc('settings/users').set(ud);
+      err('جارٍ نقل المستخدمين…');await withTimeout(FBX.restCommit([['settings/users',ud]]),30000,'users');
       const entries=Object.entries(j.docs).filter(([p])=>p!=='settings/users');let n=0;
-      for(let a=0;a<entries.length;a+=400){const b=fdb.batch();for(const[p,d]of entries.slice(a,a+400))b.set(fdb.doc(p),d);await b.commit();n+=Math.min(400,entries.length-a);err(`جارٍ نقل البيانات… ${n}/${entries.length}`);}
-    }catch(e2){return err('تعذّر نقل البيانات: '+(e2.code||e2.message)+'. تأكد إنك لصقت قواعد الحماية في Firestore ← Rules ودوست Publish.');}
+      for(let a=0;a<entries.length;a+=200){await withTimeout(FBX.restCommit(entries.slice(a,a+200)),60000,'data');n+=Math.min(200,entries.length-a);err(`جارٍ نقل البيانات… ${n}/${entries.length}`);}
+    }catch(e2){return err('تعذّر نقل البيانات: '+(e2.code==='timeout'?'قاعدة البيانات مش بترد':e2.message)+' · قاعدة البيانات: '+FBX.DBID+'. تأكد إن Firestore معمولة وإنك لصقت القواعد ودوست Publish.');}
     users=ud.users;delete ud.users;usersDoc=ud;
     me=u;await saveSession();await afterLogin('نقل السيستم إلى Firebase');return;
   }
@@ -747,17 +784,17 @@ gate.addEventListener('submit',async e=>{
     const u=v('g-user').trim().toLowerCase(), pw=v('g-pw'); gateUser=u; const x=users[u];
     if(!x)return err('اسم المستخدم أو كلمة السر غير صحيحة.');
     if(x.locked)return err('هذا الحساب موقوف. تواصل مع المالك.');
-    if(!x.wk)return err('حسابك يحتاج كلمة سر مؤقتة من المالك قبل الدخول.');
-    const k=await unwrapKey(pw,x.wk); if(!k)return err('اسم المستخدم أو كلمة السر غير صحيحة.');
-    DK=k;
-    try{await fbSignIn(u);}catch(e2){DK=null;return err(fbErr(e2));}
+    if(!x.wk||!x.wb)return err('حسابك يحتاج كلمة سر مؤقتة من المالك قبل الدخول.');
+    const o=await openWrap(pw,x); if(!o)return err('اسم المستخدم أو كلمة السر غير صحيحة.');
+    DK=o.dk;myBundle=o.b||{};await loadAK();
+    try{await withTimeout(fbSignIn(u,pw,myBundle),30000,'auth');}catch(e2){DK=null;AK=null;myBundle={};return err(fbErr(e2));}
     if(x.mustChange){gateStep='setpw';gateMsg='';return render();}
     me=u;await saveSession();await afterLogin('تسجيل دخول');return;
   }
   if(step==='setpw'){
     const pw=v('g-pw'); if(!strong(pw))return err('كلمة السر 8 حروف على الأقل وفيها حروف وأرقام.'); if(pw!==v('g-pw2'))return err('كلمتا السر غير متطابقتين.');
     const x=users[gateUser]; if(!x||x.locked||!DK){gateStep='login';return render();}
-    x.wk=await wrapKey(pw);x.mustChange=false;
+    Object.assign(x,await makeWrap(pw,myBundle));x.mustChange=false;
     if(!await saveUsers())return err('تعذّر الحفظ، حاول مرة أخرى.');
     me=gateUser;gateStep='login';await saveSession();await afterLogin('تغيير كلمة السر المؤقتة');
   }
@@ -769,7 +806,7 @@ async function migrateEncrypt(){setStatus('جارٍ تشفير البيانات�
     for(const b in BR)for(const[id,r]of Object.entries(raw.days[b])){if(r&&!r.enc)await db.doc(BR[b].coll+'/'+id).set(await encDoc(r));}
     setStatus('تم تشفير البيانات ✓');}catch(e){setStatus('تعذّر تشفير بعض البيانات، أعد الدخول');}}
 let usersSaving=false, usersDoc={};
-async function saveUsers(){usersSaving=true;try{await db.doc('settings/users').set(JSON.parse(JSON.stringify({...usersDoc,users})));setStatus('تم الحفظ ✓');return true;}catch(e){setStatus('تعذّر الحفظ');return false;}finally{usersSaving=false;}}
+async function saveUsers(){usersSaving=true;try{await withTimeout(db.doc('settings/users').set(JSON.parse(JSON.stringify({...usersDoc,users}))),30000,'users');setStatus('تم الحفظ ✓');return true;}catch(e){setStatus('تعذّر الحفظ');return false;}finally{usersSaving=false;}}
 
 /* ---------- users tab ---------- */
 function owners(){return Object.entries(users).filter(([k,u])=>u.role==='owner'&&!u.locked).map(([k])=>k);}
@@ -777,7 +814,7 @@ let confirmDel=null, pwFor=null;
 function renderUsers(){
   const myRole=U().role, rows=Object.entries(users).sort((a,b)=>(a[1].role==='owner'?0:1)-(b[1].role==='owner'?0:1)||a[0].localeCompare(b[0]));
   const lockedEdit=(k,u)=>!canWrite||(u.role==='owner'&&myRole!=='owner');
-  const st=u=>u.locked?`<span class="chip" style="color:var(--exp)">${u.fails>=MAXFAIL?'مقفول (محاولات خاطئة)':'موقوف'}</span>`:(!u.wk||!u.as)?'<span class="chip adv">يحتاج كلمة سر مؤقتة</span>':u.mustChange?'<span class="chip adv">كلمة سر مؤقتة</span>':'<span class="chip cash">نشط</span>';
+  const st=u=>u.locked?`<span class="chip" style="color:var(--exp)">${u.fails>=MAXFAIL?'مقفول (محاولات خاطئة)':'موقوف'}</span>`:needsTemp(u)?'<span class="chip adv">يحتاج كلمة سر مؤقتة</span>':u.mustChange?'<span class="chip adv">كلمة سر مؤقتة</span>':'<span class="chip cash">نشط</span>';
   return `<div class="bar"><h2>المستخدمين والصلاحيات</h2><span class="grow"></span><span class="note">${rows.length} مستخدم</span></div>
   <section class="panel"><div class="ph"><h2>إضافة مستخدم</h2><span class="note">اكتب له كلمة سر مؤقتة وبلّغه بيها. أول ما يدخل هيطلب منه يغيّرها.</span></div>
    <div class="adds"><input id="nu-name" placeholder="الاسم"><input id="nu-user" placeholder="اسم المستخدم (إنجليزي)" dir="ltr"><input id="nu-pw" placeholder="كلمة سر مؤقتة" dir="ltr" autocomplete="off"><select id="nu-role">${Object.entries(ROLES).filter(([r])=>r!=='owner'||myRole==='owner').map(([r,n])=>`<option value="${r}"${r==='cashier'?' selected':''}>${n}</option>`).join('')}</select>
@@ -808,9 +845,18 @@ app.addEventListener('click',async e=>{
   if(t.dataset.utemp){pwFor=t.dataset.utemp;render();$('#tp-pw')?.focus();return;}
   if(a==='settemp'){const pw=$('#tp-pw').value;const er=$('#tp-err');if(!strong(pw)){er.textContent='8 حروف على الأقل وفيها حروف وأرقام.';return;}
     const k=pwFor;const u=users[k];if(!u||!DK)return;const self=k===me;
-    if(!self&&!has('users'))return;
-    if(!u.as){if(self)return;const secret=newSecret();try{await createFbUser(k,secret);}catch(e2){er.textContent=fbErr(e2);return;}u.as=await encDoc({s:secret});}
-    u.wk=await wrapKey(pw);delete u.hash;delete u.salt;u.mustChange=!self;if(!self)u.locked=false;pwFor=null;
+    if(self){
+      if(!myBundle.sec){try{await FBX.updatePw(await deriveFbPw(k,pw));}catch(e2){er.textContent=fbErr(e2);return;}}
+      Object.assign(u,await makeWrap(pw,myBundle));u.mustChange=false;
+    }else{
+      if(!has('users'))return;
+      if(!AK){er.textContent='تعيين كلمات السر للمستخدمين متاح من حساب المالك الأساسي بس.';return;}
+      let sec=u.asA?(await decWith(AK,u.asA))?.s:null;
+      if(!sec){if(u.role==='owner'&&u.wb){er.textContent='المالك ده يغيّر كلمة السر بنفسه من حسابه.';return;}
+        sec=newSecret();er.textContent='جارٍ إنشاء الحساب…';try{await createFbUser(k,sec);}catch(e2){er.textContent=fbErr(e2);return;}u.asA=await encWith(AK,{s:sec});}
+      Object.assign(u,await makeWrap(pw,{sec}));u.mustChange=true;u.locked=false;
+    }
+    delete u.hash;delete u.salt;delete u.as;pwFor=null;
     await saveUsers();logAudit({a:self?'تغيير كلمة السر':'تعيين كلمة سر مؤقتة للمستخدم '+k});if(self)await saveSession();render();return;}
   if(a==='adduser'){
     const u=($('#nu-user').value||'').trim().toLowerCase(), name=$('#nu-name').value.trim(), role=$('#nu-role').value, pw=$('#nu-pw').value, er=$('#nu-err');
@@ -819,10 +865,11 @@ app.addEventListener('click',async e=>{
     if(!strong(pw)){er.textContent='كلمة السر المؤقتة 8 حروف على الأقل وفيها حروف وأرقام.';return;}
     const branches=Object.keys(BR).filter(b=>$('#nu-b-'+b)?.checked);
     const perms={};for(const p of ROLE_PERMS[role]||[])perms[p]=true;
-    const wk=await wrapKey(pw);const secret=newSecret();
-    er.textContent='جارٍ إنشاء الحساب…';try{await createFbUser(u,secret);}catch(e2){er.textContent=fbErr(e2);return;}
-    const as=await encDoc({s:secret});
-    userAct(()=>{users[u]={name:name||u,role,branches,perms,locked:false,wk,as,mustChange:true,created:new Date().toISOString()};},'إضافة المستخدم '+u);
+    if(!AK){er.textContent='إضافة مستخدمين متاحة من حساب المالك الأساسي بس.';return;}
+    const sec=newSecret();
+    er.textContent='جارٍ إنشاء الحساب…';try{await createFbUser(u,sec);}catch(e2){er.textContent=fbErr(e2);return;}
+    const w=await makeWrap(pw,{sec}), asA=await encWith(AK,{s:sec});
+    userAct(()=>{users[u]={name:name||u,role,branches,perms,locked:false,...w,asA,mustChange:true,created:new Date().toISOString()};},'إضافة المستخدم '+u);
   }
 });
 app.addEventListener('change',e=>{
